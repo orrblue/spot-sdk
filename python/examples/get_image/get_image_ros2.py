@@ -5,14 +5,14 @@
 # Development Kit License (20191101-BDSDK-SL).
 
 '''
-This file:
+To run this file:
 python3 get_image_ros2.py 192.168.50.3
 
 To run get_image.py:
 python3 get_image.py 192.168.50.3 --image-sources frontleft_fisheye_image --image-sources frontright_fisheye_image
 
 To record .db3 file on Pi:
-ros2 bag record /front_left_image /front_right_image  -o mar12_11
+ros2 bag record /front_left_image /front_right_image -o mar12_11
 
 To convert .db3 to .bag on Pi:
 rosbags-convert mar12_11
@@ -24,6 +24,9 @@ rosbags-convert mar12_11
 import argparse
 import sys
 import os
+import time
+from datetime import datetime, timedelta
+import pytz
 
 import cv2
 import numpy as np
@@ -37,9 +40,13 @@ from bosdyn.client.image import ImageClient, build_image_request
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
-from sensor_msgs.msg import Image
+# from sensor_msgs.msg import Image
 from sensor_msgs.msg import CompressedImage
 from cv_bridge import CvBridge
+from builtin_interfaces.msg import Time
+
+from bosdyn.client.time_sync import TimeSyncClient, TimeSyncEndpoint
+
 
 ROTATION_ANGLE = {
     'back_fisheye_image': 0,
@@ -62,7 +69,8 @@ def pixel_format_string_to_enum(enum_string):
 cameras = ["frontleft_fisheye_image", "frontright_fisheye_image"]
 # cameras = ["frontleft_fisheye_image"]
 
-rate = 0.033 # 0.033 == 30fps, 0.05 == 20fps
+fps = 20.0
+rate = 1.0 / fps # 0.0333 == 30fps, 0.05 == 20fps
 
 
 class MinimalPublisher(Node):
@@ -77,6 +85,9 @@ class MinimalPublisher(Node):
         timer_period = rate  # seconds
         self.timer = self.create_timer(timer_period, self.timer_callback)
         self.i = 0
+        self.skew_seconds = None # Used to store time sync data b/t computer, robot
+        # self.skew_msecs = None # Used to store time sync data b/t computer, robot
+        self.skew_musecs = None
         self.cameras = cameras
         self.bridge = CvBridge()
 
@@ -108,7 +119,27 @@ class MinimalPublisher(Node):
         self.robot.sync_with_directory()
         self.robot.time_sync.wait_for_sync()
 
+        # 1. Get time offset between robot and this computer
+        # 2. save sec, nsec variables
+        # 3. When publishing images, subtract them from the timestamp of photos
+        # https://dev.bostondynamics.com/docs/concepts/base_services.html#time-sync
         self.image_client = self.robot.ensure_client(self.options.image_service)
+        time_sync_client = self.robot.ensure_client(TimeSyncClient.default_service_name)
+        time_sync_endpoint = TimeSyncEndpoint(time_sync_client)
+        did_establish = time_sync_endpoint.establish_timesync(max_samples=10, break_on_success=False)
+        self.skew_seconds = time_sync_endpoint.clock_skew.seconds
+        # self.skew_msecs = self.nanos_to_ms(time_sync_endpoint.clock_skew.nanos)
+        self.skew_musecs = self.nanos_to_mus(time_sync_endpoint.clock_skew.nanos)
+        if (did_establish):
+            print(
+            f'Spot Clock skew seconds: {self.skew_seconds} musecs: {self.skew_musecs}'
+            )
+            print(time_sync_endpoint.clock_skew)
+            print(time_sync_endpoint.robot_timestamp_from_local_secs(time.time()))
+            print(time_sync_endpoint.robot_timestamp_from_local_secs(datetime.now().timestamp()))
+
+
+
 
         # Optionally list image sources on robot.
         if False: # NITZAN if self.list:
@@ -120,13 +151,14 @@ class MinimalPublisher(Node):
 
 
 
+
     def timer_callback(self):
         msg = String()
         msg.data = 'Hello World: %d' % self.i
         self.publisher_.publish(msg)
         # self.get_logger().info('Publishing: "%s"' % msg.data)
         
-        if self.i < 300:
+        if self.i < 600:
             # Capture and save images to disk
             pixel_format = pixel_format_string_to_enum(self.options.pixel_format)
             image_request = [
@@ -134,6 +166,26 @@ class MinimalPublisher(Node):
                 for source in cameras # NITZAN options.image_sources
             ]
             image_responses = self.image_client.get_image(image_request)
+            # resp = image_responses[0]
+            
+            # img_acq_secs = resp.shot.acquisition_time.seconds
+            # img_acq_musecs = self.nanos_to_mus(resp.shot.acquisition_time.nanos)
+            # print("Img Acq:", resp.shot.acquisition_time, "musecs: ", self.nanos_to_mus(resp.shot.acquisition_time.nanos))
+            # print()
+    
+            # epoch_datetime_mus = datetime.utcfromtimestamp(img_acq_secs) + timedelta(microseconds=img_acq_musecs)
+            # print("UTC Image Acq Time_mus:", epoch_datetime_mus)
+            
+            # subtract_delta = timedelta(seconds=self.skew_seconds, microseconds=self.skew_musecs)
+            # result_datetime = epoch_datetime_mus - subtract_delta
+            
+            # print("Result_datetime:", result_datetime)
+            # print(result_datetime.timestamp())
+            # print(result_datetime.second)
+            # print(result_datetime.microsecond)
+
+            # print("Current Epoch Time: ", (time.time()))
+            
             
             images = [0, 0]
             for n, image in enumerate(image_responses):
@@ -171,20 +223,54 @@ class MinimalPublisher(Node):
                     img = ndimage.rotate(img, ROTATION_ANGLE[image.source.name]) 
                 self.size = [len(img), len(img[0])]
 
-                image_message = None
+
+                ROS_image_message = self.bridge.cv2_to_compressed_imgmsg(img, dst_format='jpeg')
+
+                # convert image timestamp (in Spot's timestamp) to our true timestamp
+                img_acq_secs = image.shot.acquisition_time.seconds
+                img_acq_musecs = self.nanos_to_mus(image.shot.acquisition_time.nanos)
+                img_acq_datetime = datetime.fromtimestamp(img_acq_secs) + timedelta(microseconds=img_acq_musecs) 
+                subtract_delta = timedelta(seconds=self.skew_seconds, microseconds=self.skew_musecs)
+                true_datetime = img_acq_datetime - subtract_delta
+                seconds = int(true_datetime.timestamp())
+                nanoseconds = int((true_datetime.timestamp() - seconds) * 1e9)
+
+                # populate image message's timestamp with our true timestamp
+                ROS_image_message.header.stamp = Time(sec=seconds, nanosec=nanoseconds)
+
+
+                # print("Current Epoch Time: ", (time.time()))
+                # print(f'Spot Clock skew seconds: {self.skew_seconds} musecs: {self.skew_musecs}')
                 
+                # print("Image Acq Time: ", img_acq_datetime)
+                # print("Image Acq Time secs:", img_acq_datetime.timestamp())
+                # print("Image Acq Time secs:", img_acq_secs)
+                # print("Image Acq Time MuS:", img_acq_musecs)
+                
+
+                # publish image using correct publisher
                 if n == 0:
-                    image_message = self.bridge.cv2_to_compressed_imgmsg(img, dst_format='jpeg')
-                    images[0] = image_message
+                    # ROS_image_message = self.bridge.cv2_to_compressed_imgmsg(img, dst_format='jpeg')
+                    
+                    # images[0] = ROS_image_message
+                    self.front_left_image_publisher.publish(ROS_image_message)
+                    print("False acq time (sec):", n, image.shot.acquisition_time.seconds, image.shot.acquisition_time.nanos)
+                    # print("True acq time (secs):", n, true_datetime.timestamp(), (true_datetime.timestamp() - int(true_datetime.timestamp())) * 1e9)
+                    # print("True acq time (secs):", n, seconds, nanoseconds)
+                    # print("Current Time datetme:", n, datetime.now().timestamp())
+                    # print("Current Time tm.time:", n, time.time())
                     
                 elif n == 1:
-                    image_message = self.bridge.cv2_to_compressed_imgmsg(img, dst_format='jpeg')
-                    images[1] = image_message
+                    # ROS_image_message = self.bridge.cv2_to_compressed_imgmsg(img, dst_format='jpeg')
+                    # images[1] = ROS_image_message
+                    self.front_right_image_publisher.publish(ROS_image_message)
+                    print("False acq time (sec):", n, image.shot.acquisition_time.seconds, image.shot.acquisition_time.nanos)
+
                 else:
                     print("n", n)     
 
-            self.front_left_image_publisher.publish(images[0])
-            self.front_right_image_publisher.publish(images[1])
+            # self.front_left_image_publisher.publish(images[0])
+            # self.front_right_image_publisher.publish(images[1])
            
                 
 
@@ -196,7 +282,13 @@ class MinimalPublisher(Node):
             self.i += 1        
  
 
+    # nanoseconds to milliseconds
+    def nanos_to_ms(self, nanoseconds):
+        return (nanoseconds / 1_000_000)
 
+    # nanoseconds to microseconds
+    def nanos_to_mus(self, nanoseconds):
+        return (nanoseconds / 1_000) 
 
 
 if __name__ == '__main__':
