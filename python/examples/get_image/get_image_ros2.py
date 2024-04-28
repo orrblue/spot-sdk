@@ -66,10 +66,11 @@ def pixel_format_string_to_enum(enum_string):
     return dict(image_pb2.Image.PixelFormat.items()).get(enum_string)
 
 
-cameras = ["frontleft_fisheye_image", "frontright_fisheye_image"]
+cameras = ["frontleft_fisheye_image", "hand_color_image"]
+# cameras = ["frontleft_fisheye_image", "hand_color_image", "frontright_fisheye_image"]
 # cameras = ["frontleft_fisheye_image"]
 
-fps = 20.0
+fps = 40.0
 rate = 1.0 / fps # 0.0333 == 30fps, 0.05 == 20fps
 
 
@@ -77,11 +78,10 @@ class MinimalPublisher(Node):
 
     def __init__(self, argv):
         super().__init__('minimal_publisher')
-        self.publisher_ = self.create_publisher(String, 'some_topic', 1)
-        # self.image_publisher = self.create_publisher(Image, 'images', 2)
         self.front_left_image_publisher = self.create_publisher(CompressedImage, 'front_left_image', 0)
         self.front_right_image_publisher = self.create_publisher(CompressedImage, 'front_right_image', 0) 
-        
+        self.gripper_image_publisher = self.create_publisher(CompressedImage, 'gripper_image', 0)
+
         timer_period = rate  # seconds
         self.timer = self.create_timer(timer_period, self.timer_callback)
         self.i = 0
@@ -91,9 +91,6 @@ class MinimalPublisher(Node):
         self.cameras = cameras
         self.bridge = CvBridge()
 
-        # self.image_publishers = []
-        # for source in self.cameras:
-        #     self.image_publishers.append(self.create_publisher(Image, source, 1))
 
         # Parse args
         self.parser = argparse.ArgumentParser()
@@ -139,10 +136,9 @@ class MinimalPublisher(Node):
             print(time_sync_endpoint.robot_timestamp_from_local_secs(datetime.now().timestamp()))
 
 
-
-
         # Optionally list image sources on robot.
-        if False: # NITZAN if self.list:
+        list_sources = True
+        if list_sources: # NITZAN if self.list:
             image_sources = self.image_client.list_image_sources()
             print('Image sources:')
             for source in image_sources:
@@ -151,135 +147,131 @@ class MinimalPublisher(Node):
 
 
 
-
     def timer_callback(self):
-        msg = String()
-        msg.data = 'Hello World: %d' % self.i
-        self.publisher_.publish(msg)
-        # self.get_logger().info('Publishing: "%s"' % msg.data)
         
-        if self.i < 600:
-            # Capture and save images to disk
-            pixel_format = pixel_format_string_to_enum(self.options.pixel_format)
-            image_request = [
-                build_image_request(source, pixel_format=pixel_format) 
-                for source in cameras # NITZAN options.image_sources
-            ]
-            image_responses = self.image_client.get_image(image_request)
-            # resp = image_responses[0]
-            
-            # img_acq_secs = resp.shot.acquisition_time.seconds
-            # img_acq_musecs = self.nanos_to_mus(resp.shot.acquisition_time.nanos)
-            # print("Img Acq:", resp.shot.acquisition_time, "musecs: ", self.nanos_to_mus(resp.shot.acquisition_time.nanos))
-            # print()
-    
-            # epoch_datetime_mus = datetime.utcfromtimestamp(img_acq_secs) + timedelta(microseconds=img_acq_musecs)
-            # print("UTC Image Acq Time_mus:", epoch_datetime_mus)
-            
-            # subtract_delta = timedelta(seconds=self.skew_seconds, microseconds=self.skew_musecs)
-            # result_datetime = epoch_datetime_mus - subtract_delta
-            
-            # print("Result_datetime:", result_datetime)
-            # print(result_datetime.timestamp())
-            # print(result_datetime.second)
-            # print(result_datetime.microsecond)
+        # if self.i < 3000:
+        # Capture and save images to disk
+        # pixel_format = pixel_format_string_to_enum(self.options.pixel_format)
+        pixel_format = image_pb2.Image.PIXEL_FORMAT_RGB_U8 # NITZAN
+        image_request = [
+            build_image_request(source, pixel_format=pixel_format) 
+            for source in cameras # NITZAN options.image_sources
+        ]
+        image_responses = self.image_client.get_image(image_request)
+        # resp = image_responses[0]
+        
+        # img_acq_secs = resp.shot.acquisition_time.seconds
+        # img_acq_musecs = self.nanos_to_mus(resp.shot.acquisition_time.nanos)
+        # print("Img Acq:", resp.shot.acquisition_time, "musecs: ", self.nanos_to_mus(resp.shot.acquisition_time.nanos))
+        # print()
+
+        # epoch_datetime_mus = datetime.utcfromtimestamp(img_acq_secs) + timedelta(microseconds=img_acq_musecs)
+        # print("UTC Image Acq Time_mus:", epoch_datetime_mus)
+        
+        # subtract_delta = timedelta(seconds=self.skew_seconds, microseconds=self.skew_musecs)
+        # result_datetime = epoch_datetime_mus - subtract_delta
+        
+        # print("Result_datetime:", result_datetime)
+        # print(result_datetime.timestamp())
+        # print(result_datetime.second)
+        # print(result_datetime.microsecond)
+
+        # print("Current Epoch Time: ", (time.time()))
+        
+        
+        images = [0, 0]
+        for n, image in enumerate(image_responses):
+            num_bytes = 1  # Assume a default of 1 byte encodings.
+            if image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_DEPTH_U16:
+                dtype = np.uint16
+                extension = '.png'
+            else:
+                if image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_RGB_U8:
+                    num_bytes = 3
+                elif image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_RGBA_U8:
+                    num_bytes = 4
+                elif image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_GREYSCALE_U8:
+                    num_bytes = 1
+                elif image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_GREYSCALE_U16:
+                    num_bytes = 2
+                dtype = np.uint8
+                extension = '.jpg'
+            img = np.frombuffer(image.shot.image.data, dtype=dtype)
+            if image.shot.image.format == image_pb2.Image.FORMAT_RAW:
+                try:
+                    # Attempt to reshape array into a RGB rows X cols shape.
+                    img = img.reshape((image.shot.image.rows, image.shot.image.cols, num_bytes))
+                except ValueError:
+                    # Unable to reshape the image data, trying a regular decode.
+                    img = cv2.imdecode(img, -1)
+            else:
+                img = cv2.imdecode(img, -1)
+
+            resize = False
+            rotate = False # HIGH COMPUTATION COST. Resizing beforehand helps.
+            if resize:
+                img = cv2.resize(img, (320, 240))
+            if rotate and image.source.name in ROTATION_ANGLE:
+                img = ndimage.rotate(img, ROTATION_ANGLE[image.source.name]) 
+            self.size = [len(img), len(img[0])]
+
+
+            ROS_image_message = self.bridge.cv2_to_compressed_imgmsg(img, dst_format='jpeg')
+
+            # convert image timestamp (in Spot's timestamp) to our true timestamp
+            img_acq_secs = image.shot.acquisition_time.seconds
+            img_acq_musecs = self.nanos_to_mus(image.shot.acquisition_time.nanos)
+            img_acq_datetime = datetime.fromtimestamp(img_acq_secs) + timedelta(microseconds=img_acq_musecs) 
+            subtract_delta = timedelta(seconds=self.skew_seconds, microseconds=self.skew_musecs)
+            true_datetime = img_acq_datetime - subtract_delta
+            seconds = int(true_datetime.timestamp())
+            nanoseconds = int((true_datetime.timestamp() - seconds) * 1e9)
+
+            # populate image message's timestamp with our true timestamp
+            ROS_image_message.header.stamp = Time(sec=seconds, nanosec=nanoseconds)
+
 
             # print("Current Epoch Time: ", (time.time()))
+            # print(f'Spot Clock skew seconds: {self.skew_seconds} musecs: {self.skew_musecs}')
             
+            # print("Image Acq Time: ", img_acq_datetime)
+            # print("Image Acq Time secs:", img_acq_datetime.timestamp())
+            # print("Image Acq Time secs:", img_acq_secs)
+            # print("Image Acq Time MuS:", img_acq_musecs)
             
-            images = [0, 0]
-            for n, image in enumerate(image_responses):
-                num_bytes = 1  # Assume a default of 1 byte encodings.
-                if image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_DEPTH_U16:
-                    dtype = np.uint16
-                    extension = '.png'
-                else:
-                    if image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_RGB_U8:
-                        num_bytes = 3
-                    elif image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_RGBA_U8:
-                        num_bytes = 4
-                    elif image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_GREYSCALE_U8:
-                        num_bytes = 1
-                    elif image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_GREYSCALE_U16:
-                        num_bytes = 2
-                    dtype = np.uint8
-                    extension = '.jpg'
-                img = np.frombuffer(image.shot.image.data, dtype=dtype)
-                if image.shot.image.format == image_pb2.Image.FORMAT_RAW:
-                    try:
-                        # Attempt to reshape array into a RGB rows X cols shape.
-                        img = img.reshape((image.shot.image.rows, image.shot.image.cols, num_bytes))
-                    except ValueError:
-                        # Unable to reshape the image data, trying a regular decode.
-                        img = cv2.imdecode(img, -1)
-                else:
-                    img = cv2.imdecode(img, -1)
 
-                resize = False
-                rotate = False # HIGH COMPUTATION COST. Resizing beforehand helps.
-                if resize:
-                    img = cv2.resize(img, (320, 240))
-                if rotate and image.source.name in ROTATION_ANGLE:
-                    img = ndimage.rotate(img, ROTATION_ANGLE[image.source.name]) 
-                self.size = [len(img), len(img[0])]
-
-
-                ROS_image_message = self.bridge.cv2_to_compressed_imgmsg(img, dst_format='jpeg')
-
-                # convert image timestamp (in Spot's timestamp) to our true timestamp
-                img_acq_secs = image.shot.acquisition_time.seconds
-                img_acq_musecs = self.nanos_to_mus(image.shot.acquisition_time.nanos)
-                img_acq_datetime = datetime.fromtimestamp(img_acq_secs) + timedelta(microseconds=img_acq_musecs) 
-                subtract_delta = timedelta(seconds=self.skew_seconds, microseconds=self.skew_musecs)
-                true_datetime = img_acq_datetime - subtract_delta
-                seconds = int(true_datetime.timestamp())
-                nanoseconds = int((true_datetime.timestamp() - seconds) * 1e9)
-
-                # populate image message's timestamp with our true timestamp
-                ROS_image_message.header.stamp = Time(sec=seconds, nanosec=nanoseconds)
-
-
-                # print("Current Epoch Time: ", (time.time()))
-                # print(f'Spot Clock skew seconds: {self.skew_seconds} musecs: {self.skew_musecs}')
+            # publish image using correct publisher
+            if n == 0:
+                # ROS_image_message = self.bridge.cv2_to_compressed_imgmsg(img, dst_format='jpeg')
                 
-                # print("Image Acq Time: ", img_acq_datetime)
-                # print("Image Acq Time secs:", img_acq_datetime.timestamp())
-                # print("Image Acq Time secs:", img_acq_secs)
-                # print("Image Acq Time MuS:", img_acq_musecs)
+                # images[0] = ROS_image_message
+                self.front_left_image_publisher.publish(ROS_image_message)
+                # print("False acq time (sec):", n, image.shot.acquisition_time.seconds, image.shot.acquisition_time.nanos)
+                # print("True acq time (secs):", n, true_datetime.timestamp(), (true_datetime.timestamp() - int(true_datetime.timestamp())) * 1e9)
+                # print("True acq time (secs):", n, seconds, nanoseconds)
+                # print("Current Time datetme:", n, datetime.now().timestamp())
+                # print("Current Time tm.time:", n, time.time())
+
+            elif n == 1:
+                self.gripper_image_publisher.publish(ROS_image_message)
                 
+            elif n == 2:
+                # ROS_image_message = self.bridge.cv2_to_compressed_imgmsg(img, dst_format='jpeg')
+                # images[1] = ROS_image_message
+                self.front_right_image_publisher.publish(ROS_image_message)
+                # print("False acq time (sec):", n, image.shot.acquisition_time.seconds, image.shot.acquisition_time.nanos)
 
-                # publish image using correct publisher
-                if n == 0:
-                    # ROS_image_message = self.bridge.cv2_to_compressed_imgmsg(img, dst_format='jpeg')
-                    
-                    # images[0] = ROS_image_message
-                    self.front_left_image_publisher.publish(ROS_image_message)
-                    print("False acq time (sec):", n, image.shot.acquisition_time.seconds, image.shot.acquisition_time.nanos)
-                    # print("True acq time (secs):", n, true_datetime.timestamp(), (true_datetime.timestamp() - int(true_datetime.timestamp())) * 1e9)
-                    # print("True acq time (secs):", n, seconds, nanoseconds)
-                    # print("Current Time datetme:", n, datetime.now().timestamp())
-                    # print("Current Time tm.time:", n, time.time())
-                    
-                elif n == 1:
-                    # ROS_image_message = self.bridge.cv2_to_compressed_imgmsg(img, dst_format='jpeg')
-                    # images[1] = ROS_image_message
-                    self.front_right_image_publisher.publish(ROS_image_message)
-                    print("False acq time (sec):", n, image.shot.acquisition_time.seconds, image.shot.acquisition_time.nanos)
-
-                else:
-                    print("n", n)     
-
-            # self.front_left_image_publisher.publish(images[0])
-            # self.front_right_image_publisher.publish(images[1])
+            
+            else:
+                print("n", n)     
            
-                
 
-            if self.i % 10 == 0:
-                print("Loop:", self.i)
-                if self.size:
-                    print("Size:", self.size)
+            # if self.i % 10 == 0:
+            #     print("Loop:", self.i)
+            #     if self.size:
+            #         print("Size:", self.size)
 
-            self.i += 1        
+            # self.i += 1        
  
 
     # nanoseconds to milliseconds
